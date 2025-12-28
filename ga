@@ -39,7 +39,7 @@ need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 # ===== preflight =====
 bold "Codex CLI + GitHub (Ubuntu) 부트스트랩 설치"
-info "이 스크립트는 apt, nvm(Node), git, SSH, Codex CLI를 설치/설정합니다."
+info "이 스크립트는: (1) GitHub 레포 생성(선택) → (2) apt/git/nvm(Node)/Codex/SSH 설정을 진행합니다."
 info "Codex는 ChatGPT(계정) 모드로 고정하여 OPENAI_API_KEY(API 과금 경로)를 쓰지 않도록 설정합니다."
 pause
 
@@ -57,6 +57,15 @@ fi
 ask "Git 커밋에 사용할 사용자명(user.name)" GIT_NAME "$(git config --global user.name || true)"
 ask "Git 커밋에 사용할 이메일(user.email)" GIT_EMAIL "$(git config --global user.email || true)"
 
+ask_yn "서버에서 GitHub 레포를 새로 생성할까요? (gh CLI 필요)" DO_CREATE_REPO "y"
+if [[ "$DO_CREATE_REPO" == "y" ]]; then
+  ask "GitHub 소유자(본인 계정/조직). 예: cw-isl" GH_OWNER "cw-isl"
+  ask "생성할 레포 이름. 예: sagfu-bootstrap" GH_REPO_NAME ""
+  # A안 기준: Public
+  GH_VISIBILITY="public"
+  info "레포 가시성은 A안 기준으로 public으로 생성합니다."
+fi
+
 ask_yn "GitHub SSH 키를 새로 생성/등록할까요?" DO_SSH "y"
 if [[ "$DO_SSH" == "y" ]]; then
   ask "SSH 키 코멘트(보통 이메일)" SSH_COMMENT "$GIT_EMAIL"
@@ -65,32 +74,62 @@ fi
 ask_yn "설치 후 GitHub 레포를 바로 clone할까요?" DO_CLONE "y"
 if [[ "$DO_CLONE" == "y" ]]; then
   ask "클론 받을 기본 경로(예: ~/src)" CLONE_BASE "$HOME/src"
-  ask "GitHub 레포 URL (SSH 권장: git@github.com:OWNER/REPO.git)" REPO_URL ""
+  ask "GitHub 레포 URL (비워두면 생성한 레포로 자동 설정)" REPO_URL ""
 fi
 
+# ===== step 1: system packages (gh 포함) =====
 bold "1) 시스템 패키지 설치"
-info "apt update / git, curl, openssh-client, ca-certificates 설치"
+info "apt update / git, curl, openssh-client, ca-certificates, gh 설치"
 pause
 sudo apt update
-sudo apt install -y git curl ca-certificates openssh-client
+sudo apt install -y git curl ca-certificates openssh-client gh
 
-bold "2) Git 전역 설정"
+# ===== step 2: create repo first =====
+bold "2) (선택) GitHub 레포 생성 (먼저 실행)"
+if [[ "$DO_CREATE_REPO" == "y" ]]; then
+  pause
+  if ! need_cmd gh; then
+    err "gh 설치가 확인되지 않습니다."
+    exit 1
+  fi
+
+  info "GitHub 인증 상태 확인"
+  if ! gh auth status -h github.com >/dev/null 2>&1; then
+    warn "아직 gh 로그인이 안 되어있습니다. 지금 로그인 진행합니다."
+    info "헤드리스 서버면 device code 방식으로 인증하면 됩니다."
+    pause
+    gh auth login -h github.com -p https
+  fi
+
+  # 이미 존재하면 스킵
+  if gh repo view "${GH_OWNER}/${GH_REPO_NAME}" >/dev/null 2>&1; then
+    warn "이미 존재하는 레포입니다: ${GH_OWNER}/${GH_REPO_NAME} (생성 스킵)"
+  else
+    info "Public 레포 생성: ${GH_OWNER}/${GH_REPO_NAME}"
+    gh repo create "${GH_OWNER}/${GH_REPO_NAME}" --public --confirm
+    info "레포 생성 완료."
+  fi
+else
+  info "레포 생성 단계는 건너뜁니다."
+fi
+
+# ===== step 3: git global config =====
+bold "3) Git 전역 설정"
 pause
 git config --global user.name "$GIT_NAME"
 git config --global user.email "$GIT_EMAIL"
 info "git config --global user.name  = $(git config --global user.name)"
 info "git config --global user.email = $(git config --global user.email)"
 
-bold "3) Node.js (nvm) 설치 및 Node 20 사용"
+# ===== step 4: nvm + node =====
+bold "4) Node.js (nvm) 설치 및 Node 20 사용"
 pause
 if [[ ! -d "$HOME/.nvm" ]]; then
   info "nvm 설치"
   curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
 fi
 
-# shellcheck disable=SC1090
 export NVM_DIR="$HOME/.nvm"
-# shellcheck disable=SC1091
 [[ -s "$NVM_DIR/nvm.sh" ]] && . "$NVM_DIR/nvm.sh"
 if ! need_cmd nvm; then
   err "nvm 로드 실패. 새 셸을 열고 다시 실행하거나, ~/.bashrc가 적용되는지 확인하세요."
@@ -102,7 +141,8 @@ nvm install 20
 nvm use 20
 info "node: $(node -v), npm: $(npm -v)"
 
-bold "4) Codex CLI 설치"
+# ===== step 5: codex =====
+bold "5) Codex CLI 설치"
 pause
 npm i -g @openai/codex
 if ! need_cmd codex; then
@@ -111,32 +151,27 @@ if ! need_cmd codex; then
 fi
 info "codex: $(codex --version)"
 
-bold "5) Codex를 ChatGPT(계정) 모드로 고정 + API키 경로 차단"
+bold "6) Codex를 ChatGPT(계정) 모드로 고정 + API키 경로 차단"
 pause
-
-# config.toml 생성/수정
 CODEX_DIR="$HOME/.codex"
 CODEX_CFG="$CODEX_DIR/config.toml"
 mkdir -p "$CODEX_DIR"
 
-# preferred_auth_method를 chatgpt로 강제
 if [[ -f "$CODEX_CFG" ]]; then
-  # 기존 파일에서 preferred_auth_method 라인 제거 후 추가
   grep -v '^\s*preferred_auth_method\s*=' "$CODEX_CFG" > "$CODEX_CFG.tmp" || true
   mv "$CODEX_CFG.tmp" "$CODEX_CFG"
 fi
 printf 'preferred_auth_method = "chatgpt"\n' >> "$CODEX_CFG"
 info "설정 파일: $CODEX_CFG"
-info "내용:"
 cat "$CODEX_CFG"
 
-# 현재 셸에서 API키 제거(실수 방지)
 unset OPENAI_API_KEY || true
 info "현재 셸의 OPENAI_API_KEY는 unset 처리했습니다."
 warn "systemd/프로필(.bashrc/.profile)에 OPENAI_API_KEY가 들어있다면 제거해야 완전 차단됩니다."
 pause
 
-bold "6) (선택) GitHub SSH 키 생성 + 등록 안내"
+# ===== step 7: ssh optional =====
+bold "7) (선택) GitHub SSH 키 생성 + 등록 안내"
 if [[ "$DO_SSH" == "y" ]]; then
   pause
   mkdir -p "$HOME/.ssh"
@@ -164,18 +199,31 @@ if [[ "$DO_SSH" == "y" ]]; then
   ssh -T git@github.com || true
 fi
 
-bold "7) (선택) 레포 clone"
+# ===== step 8: clone optional =====
+bold "8) (선택) 레포 clone"
 if [[ "$DO_CLONE" == "y" ]]; then
   pause
   mkdir -p "$CLONE_BASE"
   cd "$CLONE_BASE"
+
+  # URL을 안 넣었으면, 생성한 레포로 자동 설정
+  if [[ -z "${REPO_URL:-}" && "${DO_CREATE_REPO}" == "y" ]]; then
+    if [[ "$DO_SSH" == "y" ]]; then
+      REPO_URL="git@github.com:${GH_OWNER}/${GH_REPO_NAME}.git"
+    else
+      REPO_URL="https://github.com/${GH_OWNER}/${GH_REPO_NAME}.git"
+    fi
+    info "REPO_URL이 비어있어서 자동 설정했습니다: $REPO_URL"
+  fi
+
   info "클론: $REPO_URL"
   git clone "$REPO_URL"
   info "클론 완료. 폴더로 들어가서 codex 실행 가능:"
   info "cd $(basename "$REPO_URL" .git) && codex"
 fi
 
-bold "8) Codex 로그인(계정 모드) 안내"
+# ===== step 9: codex login 안내 =====
+bold "9) Codex 로그인(계정 모드) 안내"
 info "이제 레포 디렉토리에서 codex를 실행하면 ChatGPT 로그인(Plus)로 연결됩니다."
 info "실행: codex"
 warn "서버가 헤드리스(SSH)라 OAuth 콜백이 막히면, 로컬에서 포트포워딩 후 로그인하세요:"
