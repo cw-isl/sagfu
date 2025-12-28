@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ===== helpers =====
+bold() { printf "\033[1m%s\033[0m\n" "$*"; }
+info() { printf "• %s\n" "$*"; }
+warn() { printf "\033[33m! %s\033[0m\n" "$*"; }
+err()  { printf "\033[31m✗ %s\033[0m\n" "$*"; }
+pause() { read -r -p "계속하려면 Enter... " _; }
+
+ask() {
+  local prompt="$1" var="$2" default="${3:-}"
+  local ans=""
+  if [[ -n "$default" ]]; then
+    read -r -p "$prompt [$default]: " ans
+    ans="${ans:-$default}"
+  else
+    read -r -p "$prompt: " ans
+    while [[ -z "$ans" ]]; do
+      read -r -p "값이 비어있어요. 다시 입력: " ans
+    done
+  fi
+  printf -v "$var" "%s" "$ans"
+}
+
+ask_yn() {
+  local prompt="$1" var="$2" default="${3:-y}"
+  local ans=""
+  read -r -p "$prompt (y/n) [${default}]: " ans
+  ans="${ans:-$default}"
+  case "$ans" in
+    y|Y) printf -v "$var" "y" ;;
+    n|N) printf -v "$var" "n" ;;
+    *) warn "y 또는 n만 입력"; ask_yn "$prompt" "$var" "$default" ;;
+  esac
+}
+
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# ===== preflight =====
+bold "Codex CLI + GitHub (Ubuntu) 부트스트랩 설치"
+info "이 스크립트는 apt, nvm(Node), git, SSH, Codex CLI를 설치/설정합니다."
+info "Codex는 ChatGPT(계정) 모드로 고정하여 OPENAI_API_KEY(API 과금 경로)를 쓰지 않도록 설정합니다."
+pause
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  warn "root로 실행 중입니다. 가능하면 일반 사용자(sudo 권한)로 실행하는 것을 권장합니다."
+  pause
+fi
+
+if ! need_cmd sudo; then
+  err "sudo가 없습니다. sudo 설치/권한을 먼저 준비하세요."
+  exit 1
+fi
+
+# ===== user inputs =====
+ask "Git 커밋에 사용할 사용자명(user.name)" GIT_NAME "$(git config --global user.name || true)"
+ask "Git 커밋에 사용할 이메일(user.email)" GIT_EMAIL "$(git config --global user.email || true)"
+
+ask_yn "GitHub SSH 키를 새로 생성/등록할까요?" DO_SSH "y"
+if [[ "$DO_SSH" == "y" ]]; then
+  ask "SSH 키 코멘트(보통 이메일)" SSH_COMMENT "$GIT_EMAIL"
+fi
+
+ask_yn "설치 후 GitHub 레포를 바로 clone할까요?" DO_CLONE "y"
+if [[ "$DO_CLONE" == "y" ]]; then
+  ask "클론 받을 기본 경로(예: ~/src)" CLONE_BASE "$HOME/src"
+  ask "GitHub 레포 URL (SSH 권장: git@github.com:OWNER/REPO.git)" REPO_URL ""
+fi
+
+bold "1) 시스템 패키지 설치"
+info "apt update / git, curl, openssh-client, ca-certificates 설치"
+pause
+sudo apt update
+sudo apt install -y git curl ca-certificates openssh-client
+
+bold "2) Git 전역 설정"
+pause
+git config --global user.name "$GIT_NAME"
+git config --global user.email "$GIT_EMAIL"
+info "git config --global user.name  = $(git config --global user.name)"
+info "git config --global user.email = $(git config --global user.email)"
+
+bold "3) Node.js (nvm) 설치 및 Node 20 사용"
+pause
+if [[ ! -d "$HOME/.nvm" ]]; then
+  info "nvm 설치"
+  curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+fi
+
+# shellcheck disable=SC1090
+export NVM_DIR="$HOME/.nvm"
+# shellcheck disable=SC1091
+[[ -s "$NVM_DIR/nvm.sh" ]] && . "$NVM_DIR/nvm.sh"
+if ! need_cmd nvm; then
+  err "nvm 로드 실패. 새 셸을 열고 다시 실행하거나, ~/.bashrc가 적용되는지 확인하세요."
+  exit 1
+fi
+
+info "Node 20 설치/사용"
+nvm install 20
+nvm use 20
+info "node: $(node -v), npm: $(npm -v)"
+
+bold "4) Codex CLI 설치"
+pause
+npm i -g @openai/codex
+if ! need_cmd codex; then
+  err "codex 설치가 확인되지 않습니다. npm global 경로를 확인하세요."
+  exit 1
+fi
+info "codex: $(codex --version)"
+
+bold "5) Codex를 ChatGPT(계정) 모드로 고정 + API키 경로 차단"
+pause
+
+# config.toml 생성/수정
+CODEX_DIR="$HOME/.codex"
+CODEX_CFG="$CODEX_DIR/config.toml"
+mkdir -p "$CODEX_DIR"
+
+# preferred_auth_method를 chatgpt로 강제
+if [[ -f "$CODEX_CFG" ]]; then
+  # 기존 파일에서 preferred_auth_method 라인 제거 후 추가
+  grep -v '^\s*preferred_auth_method\s*=' "$CODEX_CFG" > "$CODEX_CFG.tmp" || true
+  mv "$CODEX_CFG.tmp" "$CODEX_CFG"
+fi
+printf 'preferred_auth_method = "chatgpt"\n' >> "$CODEX_CFG"
+info "설정 파일: $CODEX_CFG"
+info "내용:"
+cat "$CODEX_CFG"
+
+# 현재 셸에서 API키 제거(실수 방지)
+unset OPENAI_API_KEY || true
+info "현재 셸의 OPENAI_API_KEY는 unset 처리했습니다."
+warn "systemd/프로필(.bashrc/.profile)에 OPENAI_API_KEY가 들어있다면 제거해야 완전 차단됩니다."
+pause
+
+bold "6) (선택) GitHub SSH 키 생성 + 등록 안내"
+if [[ "$DO_SSH" == "y" ]]; then
+  pause
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+
+  KEY_PATH="$HOME/.ssh/id_ed25519"
+  if [[ -f "$KEY_PATH" ]]; then
+    warn "이미 $KEY_PATH 키가 존재합니다. 새로 만들지 않고 기존 키를 사용합니다."
+  else
+    ssh-keygen -t ed25519 -C "$SSH_COMMENT" -f "$KEY_PATH"
+  fi
+
+  eval "$(ssh-agent -s)"
+  ssh-add "$KEY_PATH"
+
+  bold "아래 공개키를 GitHub > Settings > SSH and GPG keys 에 등록하세요:"
+  echo
+  cat "${KEY_PATH}.pub"
+  echo
+  echo "등록이 끝나면 Enter를 눌러 다음으로 진행하세요."
+  pause
+
+  info "연결 테스트: ssh -T git@github.com"
+  warn "처음이면 'Are you sure you want to continue connecting' 질문에 yes 입력"
+  ssh -T git@github.com || true
+fi
+
+bold "7) (선택) 레포 clone"
+if [[ "$DO_CLONE" == "y" ]]; then
+  pause
+  mkdir -p "$CLONE_BASE"
+  cd "$CLONE_BASE"
+  info "클론: $REPO_URL"
+  git clone "$REPO_URL"
+  info "클론 완료. 폴더로 들어가서 codex 실행 가능:"
+  info "cd $(basename "$REPO_URL" .git) && codex"
+fi
+
+bold "8) Codex 로그인(계정 모드) 안내"
+info "이제 레포 디렉토리에서 codex를 실행하면 ChatGPT 로그인(Plus)로 연결됩니다."
+info "실행: codex"
+warn "서버가 헤드리스(SSH)라 OAuth 콜백이 막히면, 로컬에서 포트포워딩 후 로그인하세요:"
+info "ssh -L 1455:localhost:1455 user@SERVER"
+pause
+
+bold "완료!"
+info "다음 단계: (레포 폴더에서) codex 실행 → 로그인 → 작업"
